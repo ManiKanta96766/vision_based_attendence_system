@@ -35,12 +35,22 @@ def center_of_box(box):
     x1, y1, x2, y2 = map(int, box)
     return ((x1 + x2) // 2, (y1 + y2) // 2)
 
+# Initialize session state
+if 'recognized' not in st.session_state:
+    st.session_state.recognized = {}
+if 'unknown_faces' not in st.session_state:
+    st.session_state.unknown_faces = []
+if 'running' not in st.session_state:
+    st.session_state.running = False
+if 'video' not in st.session_state:
+    st.session_state.video = None
+
 # Streamlit Page
 st.set_page_config(page_title="Face Recognition Attendance", layout="wide")
 st.title("🎯 Face Recognition Attendance System")
 
 # Tabs
-tab1, tab2, tab3 = st.tabs(["📸 Live Recognition", "📄 Attendance Records", "📊 Evaluation Metrics"])
+tab1, tab2, tab3, tab4 = st.tabs(["📸 Live Recognition", "📄 Attendance Records", "📊 Evaluation Metrics", "➕ Register New Face"])
 
 # ======================== TAB 1 - LIVE RECOGNITION ========================
 with tab1:
@@ -48,116 +58,122 @@ with tab1:
     start_button = st.button("Start Camera")
     stop_button = st.button("Stop Camera")
     save_button = st.button("Save Attendance")
-    
+
     frame_placeholder = st.empty()
     recognized_placeholder = st.empty()
     unknown_placeholder = st.empty()
 
-    recognized = {}
-    unknown_faces = []
-    running = False
+    if start_button and not st.session_state.running:
+        st.session_state.video = cv2.VideoCapture(0)
+        st.session_state.running = True
+        st.session_state.recognized = {}
+        st.session_state.unknown_faces = []
 
-    if start_button:
-        video = cv2.VideoCapture(0)
+    if st.session_state.running:
+        video = st.session_state.video
         last_center = None
         static_frames = 0
         STATIC_LIMIT = 10
         BLUR_THRESHOLD = 50
-        running = True
 
-    while running:
         ret, frame = video.read()
         if not ret:
             st.warning("Failed to access webcam.")
-            break
+        else:
+            boxes, _ = mtcnn.detect(frame)
 
-        boxes, _ = mtcnn.detect(frame)
+            if boxes is not None:
+                for box in boxes:
+                    x1, y1, x2, y2 = map(int, box)
+                    x1, y1 = max(x1, 0), max(y1, 0)
+                    x2, y2 = min(x2, frame.shape[1]), min(y2, frame.shape[0])
 
-        if boxes is not None:
-            for box in boxes:
-                x1, y1, x2, y2 = map(int, box)
-                x1, y1 = max(x1, 0), max(y1, 0)
-                x2, y2 = min(x2, frame.shape[1]), min(y2, frame.shape[0])
+                    face_crop = frame[y1:y2, x1:x2]
+                    if face_crop.shape[0] == 0 or face_crop.shape[1] == 0:
+                        continue
 
-                face_crop = frame[y1:y2, x1:x2]
-                if face_crop.shape[0] == 0 or face_crop.shape[1] == 0:
-                    continue
+                    # Anti-Spoofing Checks
+                    current_center = center_of_box(box)
+                    if last_center is not None:
+                        movement = np.linalg.norm(np.array(current_center) - np.array(last_center))
+                        if movement < 5:  # pixel movement threshold
+                            static_frames += 1
+                        else:
+                            static_frames = 0
+                    last_center = current_center
 
-                # Anti-Spoofing Checks
-                current_center = center_of_box(box)
-                if last_center is not None:
-                    movement = np.linalg.norm(np.array(current_center) - np.array(last_center))
-                    if movement < 5:  # pixel movement threshold
-                        static_frames += 1
-                    else:
-                        static_frames = 0
-                last_center = current_center
+                    blur_val = calculate_blur(face_crop)
 
-                blur_val = calculate_blur(face_crop)
+                    if static_frames >= STATIC_LIMIT or blur_val < BLUR_THRESHOLD:
+                        # Spoof detected
+                        cv2.putText(frame, "Spoof Detected", (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                        continue
 
-                if static_frames >= STATIC_LIMIT or blur_val < BLUR_THRESHOLD:
-                    # Spoof detected
-                    cv2.putText(frame, "Spoof Detected", (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                    continue
+                    # Face Recognition
+                    try:
+                        face_crop = cv2.resize(face_crop, (160, 160))
+                        face_crop = torch.tensor(face_crop).permute(2, 0, 1).float().to(device) / 255.0
 
-                # Face Recognition
-                try:
-                    face_crop = cv2.resize(face_crop, (160, 160))
-                    face_crop = torch.tensor(face_crop).permute(2, 0, 1).float().to(device) / 255.0
+                        with torch.no_grad():
+                            emb = resnet(face_crop.unsqueeze(0)).cpu().numpy()[0]
 
-                    with torch.no_grad():
-                        emb = resnet(face_crop.unsqueeze(0)).cpu().numpy()[0]
+                        min_dist = float('inf')
+                        identity = "Unknown"
 
-                    min_dist = float('inf')
-                    identity = "Unknown"
+                        for idx, ref_emb in enumerate(known_embeddings):
+                            dist = cosine(emb, ref_emb)
+                            if dist < THRESHOLD and dist < min_dist:
+                                min_dist = dist
+                                identity = known_names[idx]
 
-                    for idx, ref_emb in enumerate(known_embeddings):
-                        dist = cosine(emb, ref_emb)
-                        if dist < THRESHOLD and dist < min_dist:
-                            min_dist = dist
-                            identity = known_names[idx]
+                        timestamp = datetime.now().strftime("%H:%M:%S")
+                        if identity != "Unknown":
+                            st.session_state.recognized[identity] = timestamp
+                        else:
+                            st.session_state.unknown_faces.append(timestamp)
 
-                    timestamp = datetime.now().strftime("%H:%M:%S")
-                    if identity != "Unknown":
-                        recognized[identity] = timestamp
-                    else:
-                        unknown_faces.append(timestamp)
+                        # Draw boxes
+                        color = (0, 255, 0) if identity != "Unknown" else (0, 0, 255)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(frame, identity, (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                    except:
+                        continue
 
-                    # Draw boxes
-                    color = (0, 255, 0) if identity != "Unknown" else (0, 0, 255)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(frame, identity, (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                except:
-                    continue
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_placeholder.image(frame_rgb, channels="RGB")
 
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_placeholder.image(frame_rgb, channels="RGB")
+            recognized_list = [f"✅ {name} at {time}" for name, time in st.session_state.recognized.items()]
+            unknown_list = [f"❓ Unknown detected at {time}" for time in st.session_state.unknown_faces]
 
-        recognized_list = [f"✅ {name} at {time}" for name, time in recognized.items()]
-        unknown_list = [f"❓ Unknown detected at {time}" for time in unknown_faces]
+            recognized_placeholder.markdown("### Recognized:")
+            recognized_placeholder.text("\n".join(recognized_list))
 
-        recognized_placeholder.markdown("### Recognized:")
-        recognized_placeholder.text("\n".join(recognized_list))
+            unknown_placeholder.markdown("### Unknowns:")
+            unknown_placeholder.text("\n".join(unknown_list))
 
-        unknown_placeholder.markdown("### Unknowns:")
-        unknown_placeholder.text("\n".join(unknown_list))
+    if stop_button and st.session_state.running:
+        st.session_state.running = False
+        if st.session_state.video:
+            st.session_state.video.release()
 
-        if stop_button:
-            running = False
-            video.release()
-            break
+    if save_button:
+        if st.session_state.recognized:
+            date = datetime.now().strftime("%d-%m-%Y")
+            filename = f"Attendance_{date}.csv"
 
-    if save_button and recognized:
-        date = datetime.now().strftime("%d-%m-%Y")
-        filename = f"Attendance_{date}.csv"
-        with open(filename, "w") as f:
-            f.write("NAME,TIME\n")
-            for name, time in recognized.items():
-                f.write(f"{name},{time}\n")
-        st.success(f"Attendance saved to {filename}")
+            if not os.path.exists(filename):
+                with open(filename, "w") as f:
+                    f.write("NAME,TIME\n")
+
+            with open(filename, "a") as f:
+                for name, time in st.session_state.recognized.items():
+                    f.write(f"{name},{time}\n")
+            st.success(f"✅ Attendance saved to `{filename}`")
+        else:
+            st.warning("⚠️ No faces recognized, attendance not saved.")
 
 # ======================== TAB 2 - ATTENDANCE RECORDS ========================
 with tab2:
@@ -219,3 +235,58 @@ with tab3:
         st.write(f"F1 Score: **{f1*100:.2f}%**")
         st.write(f"False Acceptance Rate (FAR): **{FAR:.2f}%**")
         st.write(f"False Rejection Rate (FRR): **{FRR:.2f}%**")
+
+
+# ======================== TAB 4 - REGISTER NEW FACE ========================
+with tab4:
+    st.header("Register a New Face 🧑‍💼")
+    name_input = st.text_input("Enter Name:")
+    capture_button = st.button("Capture Face and Register")
+
+    if capture_button:
+        if not name_input.strip():
+            st.warning("⚠️ Please enter a valid name before capturing.")
+        else:
+            video = cv2.VideoCapture(0)
+            st.info("Capturing... Look at the camera 📸")
+            ret, frame = video.read()
+            if ret:
+                boxes, _ = mtcnn.detect(frame)
+                if boxes is not None:
+                    for box in boxes:
+                        x1, y1, x2, y2 = map(int, box)
+                        x1, y1 = max(x1, 0), max(y1, 0)
+                        x2, y2 = min(x2, frame.shape[1]), min(y2, frame.shape[0])
+
+                        face_crop = frame[y1:y2, x1:x2]
+                        if face_crop.shape[0] == 0 or face_crop.shape[1] == 0:
+                            continue
+
+                        try:
+                            face_crop = cv2.resize(face_crop, (160, 160))
+                            face_crop = torch.tensor(face_crop).permute(2, 0, 1).float().to(device) / 255.0
+
+                            with torch.no_grad():
+                                emb = resnet(face_crop.unsqueeze(0)).cpu().numpy()[0]
+
+                            # Update known embeddings and names
+                            known_embeddings_list = known_embeddings.tolist()
+                            known_embeddings_list.append(emb.tolist())
+                            known_embeddings[:] = np.array(known_embeddings_list)
+
+                            known_names.append(name_input)
+
+                            # Save back to pickle files
+                            with open('Data/embeddings.pkl', 'wb') as f:
+                                pickle.dump(known_embeddings, f)
+                            with open('Data/names.pkl', 'wb') as f:
+                                pickle.dump(known_names, f)
+
+                            st.success(f"✅ Face for '{name_input}' registered successfully!")
+                        except:
+                            st.error("❌ Failed to process face.")
+                else:
+                    st.warning("⚠️ No face detected. Try again.")
+            else:
+                st.error("❌ Failed to access webcam.")
+            video.release()
